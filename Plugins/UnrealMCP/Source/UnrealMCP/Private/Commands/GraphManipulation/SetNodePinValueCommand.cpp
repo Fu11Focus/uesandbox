@@ -1,0 +1,391 @@
+#include "Commands/GraphManipulation/SetNodePinValueCommand.h"
+#include "Utils/UnrealMCPCommonUtils.h"
+#include "Utils/GraphUtils.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "Engine/Blueprint.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
+#include "K2Node.h"
+#include "K2Node_CallFunction.h"
+#include "EdGraphSchema_K2.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+
+FString FSetNodePinValueCommand::CreateErrorResponse(const FString& ErrorMessage) const
+{
+    TSharedPtr<FJsonObject> ResponseObj = MakeShareable(new FJsonObject());
+    ResponseObj->SetBoolField(TEXT("success"), false);
+    ResponseObj->SetStringField(TEXT("error"), ErrorMessage);
+    
+    FString OutputString;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+    FJsonSerializer::Serialize(ResponseObj.ToSharedRef(), Writer);
+    
+    return OutputString;
+}
+
+FString FSetNodePinValueCommand::Execute(const FString& Parameters)
+{
+    TSharedPtr<FJsonObject> JsonObject;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Parameters);
+    
+    if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
+    {
+        return CreateErrorResponse(TEXT("Invalid JSON parameters"));
+    }
+
+    // Parse required parameters
+    FString BlueprintName;
+    if (!JsonObject->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return CreateErrorResponse(TEXT("Missing required parameter: blueprint_name"));
+    }
+
+    FString NodeId;
+    if (!JsonObject->TryGetStringField(TEXT("node_id"), NodeId))
+    {
+        return CreateErrorResponse(TEXT("Missing required parameter: node_id"));
+    }
+
+    FString PinName;
+    if (!JsonObject->TryGetStringField(TEXT("pin_name"), PinName))
+    {
+        return CreateErrorResponse(TEXT("Missing required parameter: pin_name"));
+    }
+
+    FString Value;
+    if (!JsonObject->TryGetStringField(TEXT("value"), Value))
+    {
+        return CreateErrorResponse(TEXT("Missing required parameter: value"));
+    }
+
+    FString TargetGraph = TEXT("EventGraph");
+    JsonObject->TryGetStringField(TEXT("target_graph"), TargetGraph);
+
+    // Find the blueprint
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    // Find the graph
+    UEdGraph* Graph = nullptr;
+    for (UEdGraph* CurrentGraph : Blueprint->UbergraphPages)
+    {
+        if (CurrentGraph && CurrentGraph->GetName() == TargetGraph)
+        {
+            Graph = CurrentGraph;
+            break;
+        }
+    }
+
+    // Also check function graphs
+    if (!Graph)
+    {
+        for (UEdGraph* CurrentGraph : Blueprint->FunctionGraphs)
+        {
+            if (CurrentGraph && CurrentGraph->GetName() == TargetGraph)
+            {
+                Graph = CurrentGraph;
+                break;
+            }
+        }
+    }
+
+    if (!Graph)
+    {
+        return CreateErrorResponse(FString::Printf(TEXT("Graph '%s' not found in blueprint '%s'"), *TargetGraph, *BlueprintName));
+    }
+
+    // Find the node
+    UEdGraphNode* TargetNode = nullptr;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (Node)
+        {
+            FString CurrentNodeId = FGraphUtils::GetReliableNodeId(Node);
+            if (CurrentNodeId == NodeId)
+            {
+                TargetNode = Node;
+                break;
+            }
+        }
+    }
+
+    if (!TargetNode)
+    {
+        return CreateErrorResponse(FString::Printf(TEXT("Node not found with ID: %s"), *NodeId));
+    }
+
+    // Find the pin
+    UEdGraphPin* TargetPin = nullptr;
+    for (UEdGraphPin* Pin : TargetNode->Pins)
+    {
+        if (Pin && Pin->GetName() == PinName)
+        {
+            TargetPin = Pin;
+            break;
+        }
+    }
+
+    if (!TargetPin)
+    {
+        return CreateErrorResponse(FString::Printf(TEXT("Pin '%s' not found on node"), *PinName));
+    }
+
+    // Set the pin value based on its type
+    const UEdGraphSchema_K2* K2Schema = Cast<const UEdGraphSchema_K2>(Graph->GetSchema());
+    if (!K2Schema)
+    {
+        return CreateErrorResponse(TEXT("Graph schema is not K2 (Blueprint) schema"));
+    }
+
+    // Handle different pin types
+    if (TargetPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Class)
+    {
+        // Handle class reference pins
+        UClass* ClassToSet = nullptr;
+        
+        // Try to find the class by name
+        if (Value.StartsWith(TEXT("/Script/")))
+        {
+            // Full path provided (Engine class)
+            ClassToSet = FindObject<UClass>(nullptr, *Value);
+        }
+        else if (Value.StartsWith(TEXT("/Game/")))
+        {
+            // Full path to game asset provided
+            // Try to load as Blueprint class first
+            FString ClassPath = Value;
+            if (!ClassPath.EndsWith(TEXT("_C")))
+            {
+                // Add _C suffix for generated class
+                FString BaseName = FPaths::GetBaseFilename(Value);
+                ClassPath = FString::Printf(TEXT("%s.%s_C"), *Value, *BaseName);
+            }
+            ClassToSet = LoadObject<UClass>(nullptr, *ClassPath);
+            
+            if (!ClassToSet)
+            {
+                // Try loading as blueprint asset
+                UObject* Asset = LoadObject<UObject>(nullptr, *Value);
+                if (UBlueprint* BP = Cast<UBlueprint>(Asset))
+                {
+                    ClassToSet = BP->GeneratedClass;
+                }
+            }
+        }
+        else
+        {
+            // First, try to find as a Widget Blueprint (for UserWidget subclasses)
+            ClassToSet = FUnrealMCPCommonUtils::FindWidgetClass(Value);
+            
+            if (!ClassToSet)
+            {
+                // Short name provided, try common engine classes
+                FString FullPath = FString::Printf(TEXT("/Script/Engine.%s"), *Value);
+                ClassToSet = FindObject<UClass>(nullptr, *FullPath);
+                
+                // If not found, try without Engine prefix
+                if (!ClassToSet)
+                {
+                    ClassToSet = FindFirstObject<UClass>(*Value, EFindFirstObjectOptions::NativeFirst);
+                }
+            }
+        }
+
+        if (ClassToSet)
+        {
+            // Use schema's method to properly set class pin value
+            // This handles all the internal Blueprint requirements correctly
+            K2Schema->TrySetDefaultObject(*TargetPin, ClassToSet);
+        }
+        else
+        {
+            return CreateErrorResponse(FString::Printf(TEXT("Class not found: %s"), *Value));
+        }
+    }
+    else if (TargetPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object)
+    {
+        // Handle object reference pins (UNiagaraSystem, UStaticMesh, UMaterial, etc.)
+        // For object pins, we must set DefaultObject (pointer) not DefaultValue (string)
+        UObject* ObjectToSet = nullptr;
+
+        if (Value.StartsWith(TEXT("/Game/")) || Value.StartsWith(TEXT("/Engine/")))
+        {
+            // Full path provided - load directly
+            ObjectToSet = LoadObject<UObject>(nullptr, *Value);
+
+            // If not found, try with proper asset path format (Package.AssetName)
+            if (!ObjectToSet)
+            {
+                FString BaseName = FPaths::GetBaseFilename(Value);
+                FString FullAssetPath = FString::Printf(TEXT("%s.%s"), *Value, *BaseName);
+                ObjectToSet = LoadObject<UObject>(nullptr, *FullAssetPath);
+            }
+        }
+        else
+        {
+            // Short name provided (e.g., "NS_Explosion")
+            // Get the expected class from the pin to help narrow search
+            UClass* ExpectedClass = nullptr;
+            if (TargetPin->PinType.PinSubCategoryObject.IsValid())
+            {
+                ExpectedClass = Cast<UClass>(TargetPin->PinType.PinSubCategoryObject.Get());
+            }
+
+            // Try common asset paths
+            TArray<FString> PossiblePaths;
+            PossiblePaths.Add(FString::Printf(TEXT("/Game/Effects/%s.%s"), *Value, *Value));
+            PossiblePaths.Add(FString::Printf(TEXT("/Game/VFX/%s.%s"), *Value, *Value));
+            PossiblePaths.Add(FString::Printf(TEXT("/Game/Particles/%s.%s"), *Value, *Value));
+            PossiblePaths.Add(FString::Printf(TEXT("/Game/Materials/%s.%s"), *Value, *Value));
+            PossiblePaths.Add(FString::Printf(TEXT("/Game/Meshes/%s.%s"), *Value, *Value));
+            PossiblePaths.Add(FString::Printf(TEXT("/Game/Textures/%s.%s"), *Value, *Value));
+            PossiblePaths.Add(FString::Printf(TEXT("/Game/%s.%s"), *Value, *Value));
+
+            for (const FString& Path : PossiblePaths)
+            {
+                ObjectToSet = LoadObject<UObject>(nullptr, *Path);
+                if (ObjectToSet)
+                {
+                    // Verify type if we have expected class
+                    if (ExpectedClass && !ObjectToSet->IsA(ExpectedClass))
+                    {
+                        ObjectToSet = nullptr;
+                        continue;
+                    }
+                    break;
+                }
+            }
+
+            // Last resort: try to find any loaded object with this name
+            if (!ObjectToSet)
+            {
+                ObjectToSet = FindFirstObject<UObject>(*Value, EFindFirstObjectOptions::None, ELogVerbosity::NoLogging);
+                if (ObjectToSet && ExpectedClass && !ObjectToSet->IsA(ExpectedClass))
+                {
+                    ObjectToSet = nullptr;
+                }
+            }
+        }
+
+        if (ObjectToSet)
+        {
+            // Use schema's method to properly set object pin value
+            K2Schema->TrySetDefaultObject(*TargetPin, ObjectToSet);
+        }
+        else
+        {
+            return CreateErrorResponse(FString::Printf(TEXT("Object not found: %s. Try providing full path like /Game/Effects/%s"), *Value, *Value));
+        }
+    }
+    else if (TargetPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Byte && TargetPin->PinType.PinSubCategoryObject.IsValid())
+    {
+        // Handle enum pins
+        UEnum* EnumType = Cast<UEnum>(TargetPin->PinType.PinSubCategoryObject.Get());
+        if (EnumType)
+        {
+            // Try to find the enum value by name
+            int64 EnumValue = INDEX_NONE;
+            FString EnumDisplayName;
+            
+            // First try exact match with full name (e.g., "ESplineCoordinateSpace::World")
+            EnumValue = EnumType->GetValueByNameString(Value);
+            
+            if (EnumValue == INDEX_NONE)
+            {
+                // Try to find by short name (e.g., "World") or display name (for user-defined enums)
+                for (int32 i = 0; i < EnumType->NumEnums() - 1; ++i) // -1 to skip MAX value
+                {
+                    FString EnumName = EnumType->GetNameStringByIndex(i);
+                    FString ShortName = EnumName;
+
+                    // Remove enum prefix (e.g., "ESplineCoordinateSpace::World" -> "World")
+                    int32 ColonPos;
+                    if (EnumName.FindLastChar(':', ColonPos))
+                    {
+                        ShortName = EnumName.RightChop(ColonPos + 1);
+                    }
+
+                    // Also get the display name for user-defined enums
+                    // User-defined enums have internal names like "NewEnumerator0" but display names like "Active"
+                    FText DisplayNameText = EnumType->GetDisplayNameTextByIndex(i);
+                    FString DisplayName = DisplayNameText.ToString();
+
+                    if (ShortName.Equals(Value, ESearchCase::IgnoreCase) ||
+                        EnumName.Equals(Value, ESearchCase::IgnoreCase) ||
+                        DisplayName.Equals(Value, ESearchCase::IgnoreCase))
+                    {
+                        EnumValue = i;
+                        EnumDisplayName = EnumName;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                // Get the display name for the found value
+                EnumDisplayName = EnumType->GetNameStringByValue(EnumValue);
+            }
+            
+            if (EnumValue != INDEX_NONE)
+            {
+                // Set the default value to the full enum name (not the index)
+                // This makes it display properly in the Blueprint editor
+                if (EnumDisplayName.IsEmpty())
+                {
+                    EnumDisplayName = EnumType->GetNameStringByValue(EnumValue);
+                }
+                TargetPin->DefaultValue = EnumDisplayName;
+            }
+            else
+            {
+                return CreateErrorResponse(FString::Printf(TEXT("Enum value '%s' not found in enum '%s'"), *Value, *EnumType->GetName()));
+            }
+        }
+    }
+    else if (TargetPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Text)
+    {
+        // Text pins use DefaultTextValue (FText), not DefaultValue (FString).
+        // This is critical for nodes like K2Node_FormatText which parse
+        // DefaultTextValue to create dynamic argument pins (e.g. "{Value}{Suffix}").
+        TargetPin->DefaultTextValue = FText::FromString(Value);
+    }
+    else
+    {
+        // For other types (int, float, bool, string), just set the default value directly
+        TargetPin->DefaultValue = Value;
+    }
+
+    // Notify the node that a pin default value changed (before reconstruction).
+    // Nodes like K2Node_FormatText use this callback to parse the format string
+    // and create/remove dynamic argument pins.
+    TargetNode->PinDefaultValueChanged(TargetPin);
+
+    // Reconstruct the node to apply changes
+    TargetNode->ReconstructNode();
+
+    // Mark blueprint as modified
+    Blueprint->Modify();
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+    // Create success response
+    TSharedPtr<FJsonObject> ResponseObj = MakeShareable(new FJsonObject());
+    ResponseObj->SetBoolField(TEXT("success"), true);
+    ResponseObj->SetStringField(TEXT("blueprint_name"), BlueprintName);
+    ResponseObj->SetStringField(TEXT("node_id"), NodeId);
+    ResponseObj->SetStringField(TEXT("pin_name"), PinName);
+    ResponseObj->SetStringField(TEXT("value"), Value);
+    ResponseObj->SetStringField(TEXT("pin_type"), TargetPin->PinType.PinCategory.ToString());
+    ResponseObj->SetStringField(TEXT("message"), TEXT("Pin value set successfully"));
+
+    FString OutputString;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+    FJsonSerializer::Serialize(ResponseObj.ToSharedRef(), Writer);
+    
+    return OutputString;
+}

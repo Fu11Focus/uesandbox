@@ -1,0 +1,342 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Services/NiagaraServiceTypes.h"
+
+/**
+ * Interface for Niagara VFX service operations
+ * Provides abstraction for Niagara System/Emitter creation, modification, and management
+ */
+class UNREALMCP_API INiagaraService
+{
+public:
+    virtual ~INiagaraService() = default;
+
+    // ========================================================================
+    // Core Asset Management (Feature 1)
+    // ========================================================================
+
+    /**
+     * Create a new Niagara System asset
+     * @param Params - System creation parameters
+     * @param OutSystemPath - Output path of the created system
+     * @param OutError - Error message if creation fails
+     * @return Created system or nullptr if failed
+     */
+    virtual UNiagaraSystem* CreateSystem(const FNiagaraSystemCreationParams& Params, FString& OutSystemPath, FString& OutError) = 0;
+
+    /**
+     * Create a new Niagara Emitter asset
+     * @param Params - Emitter creation parameters
+     * @param OutEmitterPath - Output path of the created emitter
+     * @param OutError - Error message if creation fails
+     * @return Created emitter or nullptr if failed
+     */
+    virtual UNiagaraEmitter* CreateEmitter(const FNiagaraEmitterCreationParams& Params, FString& OutEmitterPath, FString& OutError) = 0;
+
+    /**
+     * Add an emitter to an existing system
+     * @param SystemPath - Path to the system
+     * @param EmitterPath - Path to the emitter to add
+     * @param EmitterName - Optional custom name for the emitter handle
+     * @param OutEmitterHandleId - Output GUID of the created emitter handle
+     * @param OutError - Error message if adding fails
+     * @return true if emitter was added successfully
+     */
+    virtual bool AddEmitterToSystem(const FString& SystemPath, const FString& EmitterPath, const FString& EmitterName, FGuid& OutEmitterHandleId, FString& OutError) = 0;
+
+    /**
+     * Enable or disable an emitter within a system
+     * @param SystemPath - Path to the system containing the emitter
+     * @param EmitterName - Name of the emitter to enable/disable
+     * @param bEnabled - Whether to enable (true) or disable (false) the emitter
+     * @param OutError - Error message if operation fails
+     * @return true if emitter enabled state was changed successfully
+     */
+    virtual bool SetEmitterEnabled(const FString& SystemPath, const FString& EmitterName, bool bEnabled, FString& OutError) = 0;
+
+    /**
+     * Remove an emitter from a system
+     * @param SystemPath - Path to the system containing the emitter
+     * @param EmitterName - Name of the emitter to remove
+     * @param OutError - Error message if operation fails
+     * @return true if emitter was removed successfully
+     */
+    virtual bool RemoveEmitterFromSystem(const FString& SystemPath, const FString& EmitterName, FString& OutError) = 0;
+
+    /**
+     * Set a property on an emitter
+     * @param Params - Emitter property parameters
+     * @param OutError - Error message if operation fails
+     * @return true if property was set successfully
+     */
+    virtual bool SetEmitterProperty(const FNiagaraEmitterPropertyParams& Params, FString& OutError) = 0;
+
+    /**
+     * Get properties from an emitter
+     * @param SystemPath - Path to the system containing the emitter
+     * @param EmitterName - Name of the emitter
+     * @param OutProperties - Output JSON object with emitter properties
+     * @param OutError - Error message if operation fails
+     * @return true if properties were retrieved successfully
+     */
+    virtual bool GetEmitterProperties(const FString& SystemPath, const FString& EmitterName, TSharedPtr<FJsonObject>& OutProperties, FString& OutError) = 0;
+
+    /**
+     * Get metadata about a Niagara System or Emitter
+     * @param AssetPath - Path to the asset
+     * @param Fields - Optional fields to include (nullptr = all)
+     * @param OutMetadata - Output JSON object with metadata
+     * @param EmitterName - Optional emitter name filter (required for "modules" field)
+     * @param Stage - Optional stage filter for "modules" field ("Spawn"|"Update"|"Render")
+     * @return true if metadata was retrieved successfully
+     */
+    virtual bool GetMetadata(const FString& AssetPath, const TArray<FString>* Fields, TSharedPtr<FJsonObject>& OutMetadata, const FString& EmitterName = TEXT(""), const FString& Stage = TEXT("")) = 0;
+
+    /**
+     * Get input values for a specific module
+     * @param SystemPath - Path to the Niagara System
+     * @param EmitterName - Name of the emitter containing the module
+     * @param ModuleName - Name of the module
+     * @param Stage - Stage the module is in ("Spawn", "Update", "Event")
+     * @param OutInputs - Output JSON object with module inputs
+     * @return true if inputs were retrieved successfully
+     */
+    virtual bool GetModuleInputs(const FString& SystemPath, const FString& EmitterName, const FString& ModuleName, const FString& Stage, TSharedPtr<FJsonObject>& OutInputs) = 0;
+
+    /**
+     * Get all modules in an emitter organized by stage
+     * @param SystemPath - Path to the Niagara System
+     * @param EmitterName - Name of the emitter
+     * @param OutModules - Output JSON object with modules organized by stage
+     * @return true if modules were retrieved successfully
+     */
+    virtual bool GetEmitterModules(const FString& SystemPath, const FString& EmitterName, TSharedPtr<FJsonObject>& OutModules) = 0;
+
+    /**
+     * Compile a Niagara System or Emitter
+     * @param AssetPath - Path to the asset to compile
+     * @param OutError - Error message if compilation fails
+     * @return true if compilation succeeded
+     */
+    virtual bool CompileAsset(const FString& AssetPath, FString& OutError) = 0;
+
+    /**
+     * Duplicate a Niagara System
+     * @param SourcePath - Path to the source system
+     * @param NewName - Name for the duplicated system
+     * @param FolderPath - Optional folder path for the new system
+     * @param OutNewPath - Output path of the duplicated system
+     * @param OutError - Error message if duplication fails
+     * @return true if duplication succeeded
+     */
+    virtual bool DuplicateSystem(const FString& SourcePath, const FString& NewName, const FString& FolderPath, FString& OutNewPath, FString& OutError) = 0;
+
+    // ========================================================================
+    // Module System (Feature 2)
+    // ========================================================================
+
+    /**
+     * Add a module to an emitter stage
+     * @param Params - Module add parameters
+     * @param OutModuleId - Output identifier for the added module
+     * @param OutError - Error message if adding fails
+     * @return true if module was added successfully
+     */
+    virtual bool AddModule(const FNiagaraModuleAddParams& Params, FString& OutModuleId, FString& OutError) = 0;
+
+    /**
+     * Remove a module from an emitter stage
+     * @param Params - Module remove parameters
+     * @param OutError - Error message if removal fails
+     * @return true if module was removed successfully
+     */
+    virtual bool RemoveModule(const FNiagaraModuleRemoveParams& Params, FString& OutError) = 0;
+
+    /**
+     * Search for available Niagara modules
+     * @param SearchQuery - Search string (empty for all)
+     * @param StageFilter - Optional stage filter
+     * @param MaxResults - Maximum results to return
+     * @param OutModules - Output array of module info JSON objects
+     * @return true if search completed successfully
+     */
+    virtual bool SearchModules(const FString& SearchQuery, const FString& StageFilter, int32 MaxResults, TArray<TSharedPtr<FJsonObject>>& OutModules) = 0;
+
+    /**
+     * Set an input value on a module
+     * @param Params - Module input parameters
+     * @param OutError - Error message if setting fails
+     * @return true if input was set successfully
+     */
+    virtual bool SetModuleInput(const FNiagaraModuleInputParams& Params, FString& OutError) = 0;
+
+    /**
+     * Move a module to a new position within its stage
+     * @param Params - Module move parameters
+     * @param OutError - Error message if moving fails
+     * @return true if module was moved successfully
+     */
+    virtual bool MoveModule(const FNiagaraModuleMoveParams& Params, FString& OutError) = 0;
+
+    /**
+     * Set a curve input on a module (for float curves like scale over life)
+     * @param Params - Curve input parameters with keyframes
+     * @param OutError - Error message if setting fails
+     * @return true if curve input was set successfully
+     */
+    virtual bool SetModuleCurveInput(const FNiagaraModuleCurveInputParams& Params, FString& OutError) = 0;
+
+    /**
+     * Set a color curve input on a module (for color gradients over life)
+     * @param Params - Color curve input parameters with keyframes
+     * @param OutError - Error message if setting fails
+     * @return true if color curve input was set successfully
+     */
+    virtual bool SetModuleColorCurveInput(const FNiagaraModuleColorCurveInputParams& Params, FString& OutError) = 0;
+
+    /**
+     * Set a random range input on a module (uniform random between min and max)
+     * @param Params - Random input parameters with min/max values
+     * @param OutError - Error message if setting fails
+     * @return true if random input was set successfully
+     */
+    virtual bool SetModuleRandomInput(const FNiagaraModuleRandomInputParams& Params, FString& OutError) = 0;
+
+    /**
+     * Set a linked input on a module (binding to a particle attribute like Particles.NormalizedAge)
+     * @param Params - Linked input parameters
+     * @param OutError - Error message if setting fails
+     * @return true if linked input was set successfully
+     */
+    virtual bool SetModuleLinkedInput(const FNiagaraModuleLinkedInputParams& Params, FString& OutError) = 0;
+
+    /**
+     * Set a static switch on a module
+     * Static switches control compile-time branching in modules, enabling different behavior modes
+     * @param Params - Static switch parameters
+     * @param OutError - Error message if setting fails
+     * @return true if static switch was set successfully
+     */
+    virtual bool SetModuleStaticSwitch(const FNiagaraModuleStaticSwitchParams& Params, FString& OutError) = 0;
+
+    // ========================================================================
+    // Parameters (Feature 3)
+    // ========================================================================
+
+    /**
+     * Add a parameter to a Niagara System
+     * @param Params - Parameter add parameters
+     * @param OutError - Error message if adding fails
+     * @return true if parameter was added successfully
+     */
+    virtual bool AddParameter(const FNiagaraParameterAddParams& Params, FString& OutError) = 0;
+
+    /**
+     * Set a parameter value on a Niagara System
+     * @param SystemPath - Path to the system
+     * @param ParameterName - Name of the parameter
+     * @param Value - Value to set (as JSON)
+     * @param OutError - Error message if setting fails
+     * @return true if parameter was set successfully
+     */
+    virtual bool SetParameter(const FString& SystemPath, const FString& ParameterName, const TSharedPtr<FJsonValue>& Value, FString& OutError) = 0;
+
+    // ========================================================================
+    // Data Interfaces (Feature 4)
+    // ========================================================================
+
+    /**
+     * Add a Data Interface to an emitter
+     * @param Params - Data interface parameters
+     * @param OutInterfaceId - Output identifier for the added interface
+     * @param OutError - Error message if adding fails
+     * @return true if interface was added successfully
+     */
+    virtual bool AddDataInterface(const FNiagaraDataInterfaceParams& Params, FString& OutInterfaceId, FString& OutError) = 0;
+
+    /**
+     * Set a property on a Data Interface
+     * @param SystemPath - Path to the system
+     * @param EmitterName - Name of the emitter
+     * @param InterfaceName - Name of the data interface
+     * @param PropertyName - Name of the property
+     * @param PropertyValue - Value to set (as JSON)
+     * @param OutError - Error message if setting fails
+     * @return true if property was set successfully
+     */
+    virtual bool SetDataInterfaceProperty(const FString& SystemPath, const FString& EmitterName, const FString& InterfaceName, const FString& PropertyName, const TSharedPtr<FJsonValue>& PropertyValue, FString& OutError) = 0;
+
+    // ========================================================================
+    // Renderers (Feature 5)
+    // ========================================================================
+
+    /**
+     * Add a renderer to an emitter
+     * @param Params - Renderer parameters
+     * @param OutRendererId - Output identifier for the added renderer
+     * @param OutError - Error message if adding fails
+     * @return true if renderer was added successfully
+     */
+    virtual bool AddRenderer(const FNiagaraRendererParams& Params, FString& OutRendererId, FString& OutError) = 0;
+
+    /**
+     * Set a property on a renderer
+     * @param SystemPath - Path to the system
+     * @param EmitterName - Name of the emitter
+     * @param RendererName - Name of the renderer
+     * @param PropertyName - Name of the property
+     * @param PropertyValue - Value to set (as JSON)
+     * @param OutError - Error message if setting fails
+     * @return true if property was set successfully
+     */
+    virtual bool SetRendererProperty(const FString& SystemPath, const FString& EmitterName, const FString& RendererName, const FString& PropertyName, const TSharedPtr<FJsonValue>& PropertyValue, FString& OutError) = 0;
+
+    /**
+     * Get all properties and bindings from a renderer
+     * @param SystemPath - Path to the system
+     * @param EmitterName - Name of the emitter
+     * @param RendererName - Name of the renderer (defaults to "Renderer")
+     * @param OutProperties - Output JSON object with renderer properties and bindings
+     * @param OutError - Error message if retrieval fails
+     * @return true if properties were retrieved successfully
+     */
+    virtual bool GetRendererProperties(const FString& SystemPath, const FString& EmitterName, const FString& RendererName, TSharedPtr<FJsonObject>& OutProperties, FString& OutError) = 0;
+
+    // ========================================================================
+    // Level Integration (Feature 6)
+    // ========================================================================
+
+    /**
+     * Spawn a Niagara System actor in the level
+     * @param Params - Spawn parameters
+     * @param OutActorName - Output name of the spawned actor
+     * @param OutError - Error message if spawning fails
+     * @return Spawned actor or nullptr if failed
+     */
+    virtual ANiagaraActor* SpawnActor(const FNiagaraActorSpawnParams& Params, FString& OutActorName, FString& OutError) = 0;
+
+    // ========================================================================
+    // Utility Methods
+    // ========================================================================
+
+    /**
+     * Find a Niagara System by path
+     * @param SystemPath - Path to the system
+     * @return System or nullptr if not found
+     */
+    virtual UNiagaraSystem* FindSystem(const FString& SystemPath) = 0;
+
+    /**
+     * Find a Niagara Emitter by path
+     * @param EmitterPath - Path to the emitter
+     * @return Emitter or nullptr if not found
+     */
+    virtual UNiagaraEmitter* FindEmitter(const FString& EmitterPath) = 0;
+
+    /**
+     * Refresh any open Niagara editors for an asset
+     * @param Asset - The asset to refresh editors for
+     */
+    virtual void RefreshEditors(UObject* Asset) = 0;
+};

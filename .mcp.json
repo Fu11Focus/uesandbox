@@ -1,0 +1,81 @@
+{
+  "mcpServers": {
+    "blueprintMCP": {
+      "type": "stdio",
+      "command": "/Users/mac/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Volumes/Data/macStore/UE5/unreal-mcp/Python",
+        "run",
+        "blueprint_mcp_server.py"
+      ],
+      "env": {}
+    },
+    "editorMCP": {
+      "type": "stdio",
+      "command": "/Users/mac/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Volumes/Data/macStore/UE5/unreal-mcp/Python",
+        "run",
+        "editor_mcp_server.py"
+      ],
+      "env": {}
+    },
+    "umgMCP": {
+      "type": "stdio",
+      "command": "/Users/mac/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Volumes/Data/macStore/UE5/unreal-mcp/Python",
+        "run",
+        "umg_mcp_server.py"
+      ],
+      "env": {}
+    },
+    "nodeMCP": {
+      "type": "stdio",
+      "command": "/Users/mac/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Volumes/Data/macStore/UE5/unreal-mcp/Python",
+        "run",
+        "node_mcp_server.py"
+      ],
+      "env": {}
+    },
+    "datatableMCP": {
+      "type": "stdio",
+      "command": "/Users/mac/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Volumes/Data/macStore/UE5/unreal-mcp/Python",
+        "run",
+        "datatable_mcp_server.py"
+      ],
+      "env": {}
+    },
+    "projectMCP": {
+      "type": "stdio",
+      "command": "/Users/mac/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Volumes/Data/macStore/UE5/unreal-mcp/Python",
+        "run",
+        "project_mcp_server.py"
+      ],
+      "env": {}
+    },
+    "blueprintActionMCP": {
+      "type": "stdio",
+      "command": "/Users/mac/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Volumes/Data/macStore/UE5/unreal-mcp/Python",
+        "run",
+        "blueprint_action_mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}

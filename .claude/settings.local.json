@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Volumes/Data/UE_5.7/Engine/Build/BatchFiles/Mac/Build.sh FaultEditor Mac Development -Project=/Volumes/Data/macStore/UE5/Fault/Fault.uproject -WaitMutex -FromMsBuild)",
+      "Bash(tee /tmp/fault_build2.log)",
+      "mcp__blueprintMCP__get_blueprint_metadata",
+      "mcp__blueprintActionMCP__inspect_node_pin_connection",
+      "mcp__blueprintActionMCP__find_in_blueprints",
+      "mcp__projectMCP__search_assets",
+      "mcp__nodeMCP__delete_node",
+      "mcp__blueprintMCP__modify_blueprint_component_properties",
+      "mcp__blueprintActionMCP__create_node_by_action_name",
+      "mcp__blueprintActionMCP__search_blueprint_actions",
+      "mcp__editorMCP__execute_console_command",
+      "mcp__nodeMCP__connect_blueprint_nodes",
+      "mcp__nodeMCP__set_node_pin_value",
+      "mcp__blueprintMCP__compile_blueprint",
+      "mcp__blueprintMCP__add_blueprint_variable",
+      "mcp__blueprintMCP__set_blueprint_variable_value",
+      "mcp__blueprintMCP__delete_blueprint_variable",
+      "mcp__nodeMCP__disconnect_node"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "blueprintMCP",
+    "editorMCP",
+    "umgMCP",
+    "nodeMCP",
+    "datatableMCP",
+    "projectMCP",
+    "blueprintActionMCP"
+  ]
+}

@@ -1,0 +1,1064 @@
+#include "Services/NodeCreation/EventAndVariableNodeCreator.h"
+#include "Services/MacroDiscoveryService.h"
+#include "Services/AssetDiscoveryService.h"
+#include "EdGraphSchema_K2.h"
+#include "K2Node_Event.h"
+#include "K2Node_ComponentBoundEvent.h"
+#include "K2Node_MacroInstance.h"
+#include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_MakeStruct.h"
+#include "K2Node_CallParentFunction.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Engine/SimpleConstructionScript.h"
+#include "Engine/SCS_Node.h"
+#include "Serialization/JsonWriter.h"
+#include "Serialization/JsonSerializer.h"
+#include "BlueprintVariableNodeSpawner.h"
+#include "BlueprintNodeBinder.h"
+
+// Widget Blueprint support
+#include "WidgetBlueprint.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/Widget.h"
+#include "Components/PanelWidget.h"
+
+// Include refactored node creation helpers
+#include "Services/NodeCreation/BlueprintActionDatabaseNodeCreator.h"
+#include "Services/NodeCreation/NativePropertyNodeCreator.h"
+
+FEventAndVariableNodeCreator& FEventAndVariableNodeCreator::Get()
+{
+	static FEventAndVariableNodeCreator Instance;
+	return Instance;
+}
+
+bool FEventAndVariableNodeCreator::TryCreateComponentBoundEventNode(TSharedPtr<FJsonObject> ParamsObject, UBlueprint* Blueprint,
+	const FString& BlueprintName, UEdGraph* EventGraph, int32 PositionX, int32 PositionY,
+	UEdGraphNode*& OutNode, FString& OutNodeTitle, FString& OutNodeType, FString& OutErrorMessage)
+{
+	// EXACT COPY from BlueprintNodeCreationService.cpp lines 334-445
+	if (ParamsObject.IsValid() && ParamsObject->HasField(TEXT("component_name")) && ParamsObject->HasField(TEXT("event_name")))
+	{
+		// Component Bound Event - triggered by presence of component_name and event_name in kwargs
+		FString ComponentName = ParamsObject->GetStringField(TEXT("component_name"));
+		FString DelegateEventName = ParamsObject->GetStringField(TEXT("event_name"));
+
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Creating component bound event for component '%s', event '%s'"), *ComponentName, *DelegateEventName);
+
+		// Find the component property in the Blueprint
+		FObjectProperty* ComponentProperty = FindFProperty<FObjectProperty>(Blueprint->GeneratedClass, FName(*ComponentName));
+		if (!ComponentProperty)
+		{
+			OutErrorMessage = FString::Printf(TEXT("Component '%s' not found in Blueprint '%s'"), *ComponentName, *BlueprintName);
+			UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: %s"), *OutErrorMessage);
+			return true; // We handled it (even though it failed)
+		}
+
+		// Get the component class
+		UClass* ComponentClass = ComponentProperty->PropertyClass;
+		if (!ComponentClass)
+		{
+			OutErrorMessage = FString::Printf(TEXT("Could not get class for component '%s'"), *ComponentName);
+			UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: %s"), *OutErrorMessage);
+			return true; // We handled it (even though it failed)
+		}
+
+		// Find the delegate property on the component class
+		FMulticastDelegateProperty* DelegateProperty = FindFProperty<FMulticastDelegateProperty>(ComponentClass, FName(*DelegateEventName));
+		if (!DelegateProperty)
+		{
+			OutErrorMessage = FString::Printf(TEXT("Event delegate '%s' not found on component class '%s'"), *DelegateEventName, *ComponentClass->GetName());
+			UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: %s"), *OutErrorMessage);
+			return true; // We handled it (even though it failed)
+		}
+
+		// Check if this event is already bound
+		TArray<UK2Node_ComponentBoundEvent*> AllBoundEvents;
+		FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_ComponentBoundEvent>(Blueprint, AllBoundEvents);
+
+		for (UK2Node_ComponentBoundEvent* ExistingNode : AllBoundEvents)
+		{
+			if (ExistingNode->GetComponentPropertyName() == FName(*ComponentName) &&
+				ExistingNode->DelegatePropertyName == FName(*DelegateEventName))
+			{
+				OutErrorMessage = FString::Printf(TEXT("Event '%s' is already bound to component '%s'"), *DelegateEventName, *ComponentName);
+				UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: %s"), *OutErrorMessage);
+				return true; // We handled it (even though it failed)
+			}
+		}
+
+		// Create the UK2Node_ComponentBoundEvent
+		UK2Node_ComponentBoundEvent* BoundEventNode = NewObject<UK2Node_ComponentBoundEvent>(EventGraph);
+		if (!BoundEventNode)
+		{
+			OutErrorMessage = TEXT("Failed to create UK2Node_ComponentBoundEvent");
+			UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: %s"), *OutErrorMessage);
+			return true; // We handled it (even though it failed)
+		}
+
+		// Initialize the event node
+		BoundEventNode->InitializeComponentBoundEventParams(ComponentProperty, DelegateProperty);
+		BoundEventNode->NodePosX = PositionX;
+		BoundEventNode->NodePosY = PositionY;
+
+		// Add node to graph
+		EventGraph->AddNode(BoundEventNode, true, false);
+		BoundEventNode->CreateNewGuid();
+		BoundEventNode->PostPlacedNewNode();
+		BoundEventNode->AllocateDefaultPins();
+		BoundEventNode->ReconstructNode();
+
+		OutNode = BoundEventNode;
+		OutNodeTitle = FString::Printf(TEXT("%s (%s)"), *DelegateEventName, *ComponentName);
+		OutNodeType = TEXT("UK2Node_ComponentBoundEvent");
+
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Successfully created component bound event '%s' for component '%s'"), *DelegateEventName, *ComponentName);
+		return true;
+	}
+
+	return false;
+}
+
+bool FEventAndVariableNodeCreator::TryCreateStandardEventNode(const FString& FunctionName, UEdGraph* EventGraph,
+	int32 PositionX, int32 PositionY,
+	UEdGraphNode*& OutNode, FString& OutNodeTitle, FString& OutNodeType)
+{
+	// EXACT COPY from BlueprintNodeCreationService.cpp lines 582-657
+	// Handle standard event nodes (BeginPlay, Tick, etc.)
+	if (FunctionName.StartsWith(TEXT("Receive")) ||
+		 FunctionName.Equals(TEXT("BeginPlay"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("Tick"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("EndPlay"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("ActorBeginOverlap"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("ActorEndOverlap"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("Hit"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("Destroyed"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("BeginDestroy"), ESearchCase::IgnoreCase))
+	{
+		// Create standard event node
+		UK2Node_Event* EventNode = NewObject<UK2Node_Event>(EventGraph);
+
+		// Determine the correct event name and parent class
+		FString EventName = FunctionName;
+		FString ParentClassName = TEXT("/Script/Engine.Actor");
+
+		// Map common event names to their proper "Receive" format
+		if (FunctionName.Equals(TEXT("BeginPlay"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveBeginPlay");
+		}
+		else if (FunctionName.Equals(TEXT("Tick"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveTick");
+		}
+		else if (FunctionName.Equals(TEXT("EndPlay"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveEndPlay");
+		}
+		else if (FunctionName.Equals(TEXT("ActorBeginOverlap"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveActorBeginOverlap");
+		}
+		else if (FunctionName.Equals(TEXT("ActorEndOverlap"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveActorEndOverlap");
+		}
+		else if (FunctionName.Equals(TEXT("Hit"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveHit");
+		}
+		else if (FunctionName.Equals(TEXT("Destroyed"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveDestroyed");
+		}
+		else if (FunctionName.Equals(TEXT("BeginDestroy"), ESearchCase::IgnoreCase))
+		{
+			EventName = TEXT("ReceiveBeginDestroy");
+		}
+
+		// Set up the EventReference structure
+		EventNode->EventReference.SetExternalMember(*EventName, UClass::TryFindTypeSlow<UClass>(*ParentClassName));
+		if (!EventNode->EventReference.GetMemberParentClass())
+		{
+			// Fallback to Actor class if the specific class wasn't found
+			EventNode->EventReference.SetExternalMember(*EventName, AActor::StaticClass());
+		}
+
+		// Override function - this makes it a Blueprint implementable event
+		EventNode->bOverrideFunction = true;
+
+		EventNode->NodePosX = PositionX;
+		EventNode->NodePosY = PositionY;
+		EventNode->CreateNewGuid();
+		EventGraph->AddNode(EventNode, true, true);
+		EventNode->PostPlacedNewNode();
+		EventNode->AllocateDefaultPins();
+
+		OutNode = EventNode;
+		OutNodeTitle = EventName;
+		OutNodeType = TEXT("UK2Node_Event");
+
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Created event node '%s'"), *EventName);
+		return true;
+	}
+
+	return false;
+}
+
+bool FEventAndVariableNodeCreator::TryCreateMacroNode(const FString& FunctionName, UEdGraph* EventGraph,
+	int32 PositionX, int32 PositionY,
+	UEdGraphNode*& OutNode, FString& OutNodeTitle, FString& OutNodeType, FString& OutErrorMessage)
+{
+	// EXACT COPY from BlueprintNodeCreationService.cpp lines 658-703
+	// Handle macro functions using the Macro Discovery Service
+	if (FMacroDiscoveryService::IsMacroFunction(FunctionName))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Processing macro function '%s' using MacroDiscoveryService"), *FunctionName);
+
+		// Use the macro discovery service to find the macro blueprint dynamically
+		FString MacroGraphName = FMacroDiscoveryService::MapFunctionNameToMacroGraphName(FunctionName);
+		UBlueprint* MacroBlueprint = FMacroDiscoveryService::FindMacroBlueprint(FunctionName);
+
+		if (MacroBlueprint)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found macro blueprint for '%s' via discovery service"), *FunctionName);
+
+			// Find the specific macro graph
+			UEdGraph* TargetMacroGraph = FMacroDiscoveryService::FindMacroGraph(MacroBlueprint, MacroGraphName);
+
+			if (TargetMacroGraph)
+			{
+				// Create macro instance
+				UK2Node_MacroInstance* MacroInstance = NewObject<UK2Node_MacroInstance>(EventGraph);
+				MacroInstance->SetMacroGraph(TargetMacroGraph);
+				MacroInstance->NodePosX = PositionX;
+				MacroInstance->NodePosY = PositionY;
+				MacroInstance->CreateNewGuid();
+				EventGraph->AddNode(MacroInstance, true, true);
+				MacroInstance->PostPlacedNewNode();
+				MacroInstance->AllocateDefaultPins();
+
+				OutNode = MacroInstance;
+				OutNodeTitle = FunctionName;
+				OutNodeType = TEXT("UK2Node_MacroInstance");
+
+				UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Successfully created macro instance for '%s' using discovery service"), *FunctionName);
+				return true;
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: Could not find macro graph '%s' in discovered macro blueprint"), *MacroGraphName);
+				OutErrorMessage = FString::Printf(TEXT("Could not find macro graph '%s' in discovered macro blueprint"), *MacroGraphName);
+				return true; // We handled it (even though it failed)
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: Could not discover macro blueprint for '%s'"), *FunctionName);
+			OutErrorMessage = FString::Printf(TEXT("Could not discover macro blueprint for '%s'. Macro may not be available."), *FunctionName);
+			return true; // We handled it (even though it failed)
+		}
+	}
+
+	return false;
+}
+
+bool FEventAndVariableNodeCreator::TryCreateVariableNode(const FString& FunctionName, TSharedPtr<FJsonObject> ParamsObject,
+	UBlueprint* Blueprint, const FString& BlueprintName, UEdGraph* EventGraph,
+	int32 PositionX, int32 PositionY,
+	UEdGraphNode*& OutNode, FString& OutNodeTitle, FString& OutNodeType, FString& OutErrorMessage)
+{
+	// EXACT COPY from BlueprintNodeCreationService.cpp lines 704-863
+	// Variable getter/setter node creation
+	if (FunctionName.StartsWith(TEXT("Get ")) || FunctionName.StartsWith(TEXT("Set ")) ||
+		FunctionName.Equals(TEXT("UK2Node_VariableGet"), ESearchCase::IgnoreCase) ||
+		FunctionName.Equals(TEXT("UK2Node_VariableSet"), ESearchCase::IgnoreCase))
+	{
+		FString VarName = FunctionName;
+		bool bIsGetter = false;
+		if (VarName.StartsWith(TEXT("Get ")))
+		{
+			VarName = VarName.RightChop(4);
+			bIsGetter = true;
+		}
+		else if (VarName.StartsWith(TEXT("Set ")))
+		{
+			VarName = VarName.RightChop(4);
+		}
+		// Handle explicit node class names without "Get " or "Set " prefix
+		else if (FunctionName.Equals(TEXT("UK2Node_VariableGet"), ESearchCase::IgnoreCase) ||
+				 FunctionName.Equals(TEXT("UK2Node_VariableSet"), ESearchCase::IgnoreCase))
+		{
+			// Determine getter vs setter based on node class requested
+			bIsGetter = FunctionName.Equals(TEXT("UK2Node_VariableGet"), ESearchCase::IgnoreCase);
+
+			// Attempt to pull the actual variable name from JSON parameters ("variable_name") if provided
+			if (ParamsObject.IsValid())
+			{
+				FString ParamVarName;
+				// First check at root level
+				if (ParamsObject->TryGetStringField(TEXT("variable_name"), ParamVarName) && !ParamVarName.IsEmpty())
+				{
+					VarName = ParamVarName;
+				}
+				else
+				{
+					// Then check nested under a "kwargs" object (for backward compatibility with Python tool)
+					const TSharedPtr<FJsonObject>* KwargsObject;
+					if (ParamsObject->TryGetObjectField(TEXT("kwargs"), KwargsObject) && KwargsObject->IsValid())
+					{
+						if ((*KwargsObject)->TryGetStringField(TEXT("variable_name"), ParamVarName) && !ParamVarName.IsEmpty())
+						{
+							VarName = ParamVarName;
+						}
+					}
+				}
+			}
+		}
+
+		// Log getter/setter detection and variable name
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: EffectiveFunctionName='%s', bIsGetter=%d, bIsSetter=%d, VarName='%s'"), *FunctionName, (int)bIsGetter, (int)bIsGetter, *VarName);
+
+		// Extract optional scope parameter from kwargs
+		FString Scope = TEXT("auto");  // Default: smart search
+		if (ParamsObject.IsValid())
+		{
+			// Check at root level
+			if (!ParamsObject->TryGetStringField(TEXT("scope"), Scope))
+			{
+				// Check nested under kwargs object
+				const TSharedPtr<FJsonObject>* KwargsObject;
+				if (ParamsObject->TryGetObjectField(TEXT("kwargs"), KwargsObject) && KwargsObject->IsValid())
+				{
+					(*KwargsObject)->TryGetStringField(TEXT("scope"), Scope);
+				}
+			}
+		}
+
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Variable scope='%s', VarName='%s'"), *Scope, *VarName);
+
+		// Extract class_name parameter - if specified, this indicates we want a variable from an EXTERNAL class
+		// and we should NOT create a self-member node even if a variable with the same name exists in this Blueprint
+		FString ExternalClassName;
+		if (ParamsObject.IsValid())
+		{
+			// Check at root level
+			if (!ParamsObject->TryGetStringField(TEXT("class_name"), ExternalClassName))
+			{
+				// Check nested under kwargs object
+				const TSharedPtr<FJsonObject>* KwargsObject;
+				if (ParamsObject->TryGetObjectField(TEXT("kwargs"), KwargsObject) && KwargsObject->IsValid())
+				{
+					(*KwargsObject)->TryGetStringField(TEXT("class_name"), ExternalClassName);
+				}
+			}
+		}
+
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: ExternalClassName='%s'"), *ExternalClassName);
+
+		// Try to find the variable or component in the Blueprint
+		bool bFound = false;
+
+		// NEW: Check if ExternalClassName refers to an ancestor Blueprint class
+		// If so, we should check parent class variables (accessible via self), not skip to ActionDatabase
+		bool bIsParentBlueprintClass = false;
+		if (!ExternalClassName.IsEmpty() && Blueprint->ParentClass)
+		{
+			// Check if ExternalClassName matches any class in the parent hierarchy
+			for (UClass* ParentCheck = Blueprint->ParentClass; ParentCheck; ParentCheck = ParentCheck->GetSuperClass())
+			{
+				FString ParentClassName = ParentCheck->GetName();
+				// Remove common prefixes for comparison
+				ParentClassName.RemoveFromStart(TEXT("BP_"));
+				ParentClassName.RemoveFromEnd(TEXT("_C"));
+
+				FString CheckName = ExternalClassName;
+				CheckName.RemoveFromStart(TEXT("BP_"));
+				CheckName.RemoveFromEnd(TEXT("_C"));
+
+				if (ParentClassName.Equals(CheckName, ESearchCase::IgnoreCase) ||
+					ParentCheck->GetName().Equals(ExternalClassName, ESearchCase::IgnoreCase))
+				{
+					bIsParentBlueprintClass = true;
+					UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: ExternalClassName '%s' matches parent class '%s' - will check inherited variables"),
+						*ExternalClassName, *ParentCheck->GetName());
+					break;
+				}
+			}
+		}
+
+		// NEW FEATURE: Support function parameters when scope="function" or scope="auto"
+		// Function parameters are local variables in function graphs
+		bool bShouldCheckFunctionParams = Scope.Equals(TEXT("function"), ESearchCase::IgnoreCase) ||
+		                                  Scope.Equals(TEXT("auto"), ESearchCase::IgnoreCase);
+
+		UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: bShouldCheckFunctionParams=%d, bIsGetter=%d, EventGraph=%s"),
+			(int)bShouldCheckFunctionParams, (int)bIsGetter, EventGraph ? *EventGraph->GetName() : TEXT("NULL"));
+
+		if (bShouldCheckFunctionParams && bIsGetter && EventGraph)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Entering function parameter check. Blueprint has %d function graphs."), Blueprint->FunctionGraphs.Num());
+			// Check if the EventGraph is a function graph
+			for (UEdGraph* FuncGraph : Blueprint->FunctionGraphs)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Comparing FuncGraph='%s' with EventGraph='%s'"),
+					FuncGraph ? *FuncGraph->GetName() : TEXT("NULL"),
+					EventGraph ? *EventGraph->GetName() : TEXT("NULL"));
+
+				if (FuncGraph == EventGraph)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: MATCH! Searching for function parameter '%s'"), *VarName);
+
+					// STEP 1: Try to find function INPUT PARAMETERS from UFunction properties
+					// Function input parameters are stored as FProperty in the UFunction, not as LocalVariables
+					UFunction* SkeletonFunction = FindUField<UFunction>(Blueprint->SkeletonGeneratedClass, EventGraph->GetFName());
+					if (SkeletonFunction)
+					{
+						UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found SkeletonFunction '%s', searching parameters..."), *SkeletonFunction->GetName());
+
+						// List all function parameters for debugging
+						for (TFieldIterator<FProperty> ParamIt(SkeletonFunction); ParamIt && (ParamIt->PropertyFlags & CPF_Parm); ++ParamIt)
+						{
+							FProperty* Param = *ParamIt;
+							const bool bIsFunctionInput = !Param->HasAnyPropertyFlags(CPF_ReturnParm) && (!Param->HasAnyPropertyFlags(CPF_OutParm) || Param->HasAnyPropertyFlags(CPF_ReferenceParm));
+							UE_LOG(LogTemp, Warning, TEXT("  - Function param: '%s' (isInput=%d)"), *Param->GetName(), (int)bIsFunctionInput);
+						}
+
+						// Search for the specific parameter
+						for (TFieldIterator<FProperty> ParamIt(SkeletonFunction); ParamIt && (ParamIt->PropertyFlags & CPF_Parm); ++ParamIt)
+						{
+							FProperty* Param = *ParamIt;
+							const bool bIsFunctionInput = !Param->HasAnyPropertyFlags(CPF_ReturnParm) && (!Param->HasAnyPropertyFlags(CPF_OutParm) || Param->HasAnyPropertyFlags(CPF_ReferenceParm));
+
+							if (bIsFunctionInput && Param->GetName().Equals(VarName, ESearchCase::IgnoreCase))
+							{
+								UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found matching function input parameter '%s'"), *Param->GetName());
+
+								// Use UBlueprintVariableNodeSpawner to create the node properly
+								// This is exactly how Unreal creates these nodes in the Blueprint Action Database
+								UBlueprintVariableNodeSpawner* Spawner = UBlueprintVariableNodeSpawner::CreateFromMemberOrParam(
+									UK2Node_VariableGet::StaticClass(),
+									Param,
+									EventGraph  // VarContext - the function graph
+								);
+
+								if (Spawner)
+								{
+									// Invoke the spawner to create the node - this handles all the proper setup
+									OutNode = Spawner->Invoke(EventGraph, IBlueprintNodeBinder::FBindingSet(), FVector2D(PositionX, PositionY));
+
+									if (OutNode)
+									{
+										OutNodeTitle = FString::Printf(TEXT("Get %s"), *Param->GetName());
+										OutNodeType = TEXT("UK2Node_VariableGet");
+										bFound = true;
+
+										UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Created function input parameter getter for '%s' using spawner"), *Param->GetName());
+
+										// If scope is explicitly "function", we're done
+										if (Scope.Equals(TEXT("function"), ESearchCase::IgnoreCase))
+										{
+											return true;
+										}
+									}
+									else
+									{
+										UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: Spawner->Invoke returned null for parameter '%s'"), *Param->GetName());
+									}
+								}
+								else
+								{
+									UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: Failed to create spawner for parameter '%s'"), *Param->GetName());
+								}
+								break;
+							}
+						}
+					}
+					else
+					{
+						UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: SkeletonFunction not found for graph '%s'"), *EventGraph->GetName());
+					}
+
+					// STEP 2: If not found as function parameter, try LOCAL VARIABLES
+					// Local variables are explicitly created inside functions and stored in UK2Node_FunctionEntry::LocalVariables
+					if (!bFound)
+					{
+						FGuid LocalVarGuid = FBlueprintEditorUtils::FindLocalVariableGuidByName(
+							Blueprint,
+							EventGraph,
+							FName(*VarName));
+
+						UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: FindLocalVariableGuidByName returned GUID valid=%d"), (int)LocalVarGuid.IsValid());
+
+						if (LocalVarGuid.IsValid())
+						{
+							// Found local variable!
+							UK2Node_VariableGet* LocalVarGetterNode = NewObject<UK2Node_VariableGet>(EventGraph);
+							LocalVarGetterNode->VariableReference.SetLocalMember(
+								FName(*VarName),
+								EventGraph->GetName(),
+								LocalVarGuid);
+							LocalVarGetterNode->NodePosX = PositionX;
+							LocalVarGetterNode->NodePosY = PositionY;
+							LocalVarGetterNode->CreateNewGuid();
+							EventGraph->AddNode(LocalVarGetterNode, true, true);
+							LocalVarGetterNode->PostPlacedNewNode();
+							LocalVarGetterNode->AllocateDefaultPins();
+							OutNode = LocalVarGetterNode;
+							OutNodeTitle = FString::Printf(TEXT("Get %s"), *VarName);
+							OutNodeType = TEXT("UK2Node_VariableGet");
+							bFound = true;
+
+							UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Created local variable getter for '%s'"), *VarName);
+
+							// If scope is explicitly "function", we're done
+							if (Scope.Equals(TEXT("function"), ESearchCase::IgnoreCase))
+							{
+								return true;
+							}
+						}
+					}
+					break;
+				}
+			}
+		}
+
+		// Only check Blueprint variables if scope allows it AND no external class is specified
+		// CRITICAL FIX: If class_name is specified, we want a variable from that EXTERNAL class,
+		// not a self-member variable from this Blueprint (even if a variable with the same name exists here)
+		bool bShouldCheckBlueprintVars = !Scope.Equals(TEXT("function"), ESearchCase::IgnoreCase);
+
+		// If an external class is specified, skip self-member variable creation entirely
+		// This allows the flow to continue to TryCreateNodeUsingBlueprintActionDatabase
+		// which will properly create an external member getter for the specified class
+		// EXCEPTION: If the external class is a parent Blueprint class, inherited variables ARE accessible via self
+		if (!ExternalClassName.IsEmpty() && !bIsParentBlueprintClass)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: External class '%s' specified (not a parent) - skipping self-member variable check to allow external member creation"), *ExternalClassName);
+			bShouldCheckBlueprintVars = false;
+		}
+		else if (bIsParentBlueprintClass)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: External class '%s' is a parent Blueprint - will check inherited variables via GeneratedClass"), *ExternalClassName);
+		}
+
+		if (!bFound && bShouldCheckBlueprintVars)
+		{
+			// Diagnostic logging: List all user variables and what we're searching for
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Blueprint '%s' has %d user variables. Looking for '%s'."), *Blueprint->GetName(), Blueprint->NewVariables.Num(), *VarName);
+		for (const FBPVariableDescription& VarDesc : Blueprint->NewVariables)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found variable '%s' (type: %s)"), *VarDesc.VarName.ToString(), *VarDesc.VarType.PinCategory.ToString());
+			if (VarDesc.VarName.ToString().Equals(VarName, ESearchCase::IgnoreCase))
+			{
+				if (bIsGetter)
+				{
+					UK2Node_VariableGet* GetterNode = NewObject<UK2Node_VariableGet>(EventGraph);
+					GetterNode->VariableReference.SetSelfMember(*VarName);
+					GetterNode->NodePosX = PositionX;
+					GetterNode->NodePosY = PositionY;
+					GetterNode->CreateNewGuid();
+					EventGraph->AddNode(GetterNode, true, true);
+					GetterNode->PostPlacedNewNode();
+					GetterNode->AllocateDefaultPins();
+					OutNode = GetterNode;
+					OutNodeTitle = FString::Printf(TEXT("Get %s"), *VarName);
+					OutNodeType = TEXT("UK2Node_VariableGet");
+				}
+				else
+				{
+					UK2Node_VariableSet* SetterNode = NewObject<UK2Node_VariableSet>(EventGraph);
+					SetterNode->VariableReference.SetSelfMember(*VarName);
+					SetterNode->NodePosX = PositionX;
+					SetterNode->NodePosY = PositionY;
+					SetterNode->CreateNewGuid();
+					EventGraph->AddNode(SetterNode, true, true);
+					SetterNode->PostPlacedNewNode();
+					SetterNode->AllocateDefaultPins();
+					OutNode = SetterNode;
+					OutNodeTitle = FString::Printf(TEXT("Set %s"), *VarName);
+					OutNodeType = TEXT("UK2Node_VariableSet");
+				}
+				bFound = true;
+				break;
+			}
+		}
+
+		// If not found in variables, check components
+		if (!bFound && bIsGetter && Blueprint->SimpleConstructionScript)
+		{
+			TArray<USCS_Node*> AllNodes = Blueprint->SimpleConstructionScript->GetAllNodes();
+			for (USCS_Node* Node : AllNodes)
+			{
+				if (Node && Node->GetVariableName().ToString().Equals(VarName, ESearchCase::IgnoreCase))
+				{
+					// Create component reference node using variable get approach
+					UK2Node_VariableGet* ComponentGetterNode = NewObject<UK2Node_VariableGet>(EventGraph);
+					ComponentGetterNode->VariableReference.SetSelfMember(Node->GetVariableName());
+					ComponentGetterNode->NodePosX = PositionX;
+					ComponentGetterNode->NodePosY = PositionY;
+					ComponentGetterNode->CreateNewGuid();
+					EventGraph->AddNode(ComponentGetterNode, true, true);
+					ComponentGetterNode->PostPlacedNewNode();
+					ComponentGetterNode->AllocateDefaultPins();
+					OutNode = ComponentGetterNode;
+					OutNodeTitle = FString::Printf(TEXT("Get %s"), *VarName);
+					OutNodeType = TEXT("UK2Node_VariableGet");
+					bFound = true;
+
+					UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Created component reference for '%s'"), *VarName);
+					break;
+				}
+			}
+		}
+
+		// NEW: If not found locally, check parent class hierarchy for inherited variables
+		// This applies when:
+		// 1. class_name was explicitly set to a parent Blueprint class (bIsParentBlueprintClass=true), OR
+		// 2. No class_name was specified and variable wasn't found locally (fallback check)
+		if (!bFound && (bIsParentBlueprintClass || ExternalClassName.IsEmpty()))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Checking parent class hierarchy for inherited variable '%s'"), *VarName);
+
+			// Check GeneratedClass properties - this includes inherited variables
+			if (Blueprint->GeneratedClass)
+			{
+				for (TFieldIterator<FProperty> PropIt(Blueprint->GeneratedClass); PropIt; ++PropIt)
+				{
+					FProperty* Property = *PropIt;
+					if (Property && Property->GetName().Equals(VarName, ESearchCase::IgnoreCase))
+					{
+						// Found the property! Check if it's from a parent class (not locally defined)
+						UClass* PropertyOwner = Property->GetOwnerClass();
+						bool bIsInherited = PropertyOwner && PropertyOwner != Blueprint->GeneratedClass;
+
+						if (bIsInherited || bIsParentBlueprintClass)
+						{
+							UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found inherited variable '%s' from class '%s'"),
+								*VarName, PropertyOwner ? *PropertyOwner->GetName() : TEXT("Unknown"));
+
+							// Inherited variables are accessible via self
+							if (bIsGetter)
+							{
+								UK2Node_VariableGet* GetterNode = NewObject<UK2Node_VariableGet>(EventGraph);
+								GetterNode->VariableReference.SetSelfMember(FName(*VarName));
+								GetterNode->NodePosX = PositionX;
+								GetterNode->NodePosY = PositionY;
+								GetterNode->CreateNewGuid();
+								EventGraph->AddNode(GetterNode, true, true);
+								GetterNode->PostPlacedNewNode();
+								GetterNode->AllocateDefaultPins();
+								OutNode = GetterNode;
+								OutNodeTitle = FString::Printf(TEXT("Get %s"), *VarName);
+								OutNodeType = TEXT("UK2Node_VariableGet");
+							}
+							else
+							{
+								UK2Node_VariableSet* SetterNode = NewObject<UK2Node_VariableSet>(EventGraph);
+								SetterNode->VariableReference.SetSelfMember(FName(*VarName));
+								SetterNode->NodePosX = PositionX;
+								SetterNode->NodePosY = PositionY;
+								SetterNode->CreateNewGuid();
+								EventGraph->AddNode(SetterNode, true, true);
+								SetterNode->PostPlacedNewNode();
+								SetterNode->AllocateDefaultPins();
+								OutNode = SetterNode;
+								OutNodeTitle = FString::Printf(TEXT("Set %s"), *VarName);
+								OutNodeType = TEXT("UK2Node_VariableSet");
+							}
+							bFound = true;
+							break;
+						}
+					}
+				}
+			}
+
+			if (!bFound)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Variable '%s' not found in parent class hierarchy"), *VarName);
+			}
+		}
+
+		// If not found in regular variables or components, check Widget Blueprint widget variables
+		// Widget Blueprints store widgets exposed as variables in the WidgetTree, not in NewVariables
+		if (!bFound)
+		{
+			UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(Blueprint);
+			if (WidgetBlueprint && WidgetBlueprint->WidgetTree)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Blueprint is a Widget Blueprint, checking WidgetTree for variable '%s'"), *VarName);
+
+				// Helper lambda to recursively search widgets
+				TFunction<UWidget*(UWidget*)> FindWidgetVariable = [&](UWidget* Widget) -> UWidget*
+				{
+					if (!Widget) return nullptr;
+
+					// Check if this widget matches and is exposed as a variable
+					if (Widget->bIsVariable && Widget->GetName().Equals(VarName, ESearchCase::IgnoreCase))
+					{
+						return Widget;
+					}
+
+					// Recurse into children if this is a panel widget
+					if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(Widget))
+					{
+						for (int32 i = 0; i < PanelWidget->GetChildrenCount(); ++i)
+						{
+							if (UWidget* FoundWidget = FindWidgetVariable(PanelWidget->GetChildAt(i)))
+							{
+								return FoundWidget;
+							}
+						}
+					}
+
+					return nullptr;
+				};
+
+				UWidget* FoundWidget = FindWidgetVariable(WidgetBlueprint->WidgetTree->RootWidget);
+				if (FoundWidget)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found widget variable '%s' in WidgetTree (type: %s)"), *VarName, *FoundWidget->GetClass()->GetName());
+
+					if (bIsGetter)
+					{
+						UK2Node_VariableGet* WidgetGetterNode = NewObject<UK2Node_VariableGet>(EventGraph);
+						WidgetGetterNode->VariableReference.SetSelfMember(FName(*VarName));
+						WidgetGetterNode->NodePosX = PositionX;
+						WidgetGetterNode->NodePosY = PositionY;
+						WidgetGetterNode->CreateNewGuid();
+						EventGraph->AddNode(WidgetGetterNode, true, true);
+						WidgetGetterNode->PostPlacedNewNode();
+						WidgetGetterNode->AllocateDefaultPins();
+						OutNode = WidgetGetterNode;
+						OutNodeTitle = FString::Printf(TEXT("Get %s"), *VarName);
+						OutNodeType = TEXT("UK2Node_VariableGet");
+						bFound = true;
+
+						UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Created Widget Blueprint variable getter for '%s'"), *VarName);
+					}
+					else
+					{
+						UK2Node_VariableSet* WidgetSetterNode = NewObject<UK2Node_VariableSet>(EventGraph);
+						WidgetSetterNode->VariableReference.SetSelfMember(FName(*VarName));
+						WidgetSetterNode->NodePosX = PositionX;
+						WidgetSetterNode->NodePosY = PositionY;
+						WidgetSetterNode->CreateNewGuid();
+						EventGraph->AddNode(WidgetSetterNode, true, true);
+						WidgetSetterNode->PostPlacedNewNode();
+						WidgetSetterNode->AllocateDefaultPins();
+						OutNode = WidgetSetterNode;
+						OutNodeTitle = FString::Printf(TEXT("Set %s"), *VarName);
+						OutNodeType = TEXT("UK2Node_VariableSet");
+						bFound = true;
+
+						UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Created Widget Blueprint variable setter for '%s'"), *VarName);
+					}
+				}
+			}
+		}
+		}  // End of if (!bFound && bShouldCheckBlueprintVars)
+
+		if (!bFound)
+		{
+			// Variable not found directly in the Blueprint – it might be a native property on another class.
+			// Attempt to spawn it via the Blueprint Action Database using multiple name variants so users can still
+			// create property nodes like "Get Show Mouse Cursor" on a PlayerController reference.
+			//
+			// CRITICAL: If ExternalClassName was specified, we MUST pass it to TryCreateNodeUsingBlueprintActionDatabase
+			// so that it can create an external member getter for that specific class
+
+			bool bSpawned = false;
+			bSpawned = FBlueprintActionDatabaseNodeCreator::TryCreateNodeUsingBlueprintActionDatabase(FunctionName, ExternalClassName, EventGraph, PositionX, PositionY, OutNode, OutNodeTitle, OutNodeType);
+
+			if (!bSpawned)
+			{
+				// Try trimmed variable name (without Get/Set prefix)
+				bSpawned = FBlueprintActionDatabaseNodeCreator::TryCreateNodeUsingBlueprintActionDatabase(VarName, ExternalClassName, EventGraph, PositionX, PositionY, OutNode, OutNodeTitle, OutNodeType);
+			}
+
+			if (!bSpawned && bIsGetter)
+			{
+				// Prepend "Get " to the node name in case the BAD entry includes it
+				FString GetterName = FString::Printf(TEXT("Get %s"), *VarName);
+				bSpawned = FBlueprintActionDatabaseNodeCreator::TryCreateNodeUsingBlueprintActionDatabase(GetterName, ExternalClassName, EventGraph, PositionX, PositionY, OutNode, OutNodeTitle, OutNodeType);
+			}
+			else if (!bSpawned && !bIsGetter)
+			{
+				FString SetterName = FString::Printf(TEXT("Set %s"), *VarName);
+				bSpawned = FBlueprintActionDatabaseNodeCreator::TryCreateNodeUsingBlueprintActionDatabase(SetterName, ExternalClassName, EventGraph, PositionX, PositionY, OutNode, OutNodeTitle, OutNodeType);
+			}
+
+			if (!bSpawned)
+			{
+				// Final attempt: directly construct native property node by class search
+				bSpawned = FNativePropertyNodeCreator::TryCreateNativePropertyNode(VarName, bIsGetter, EventGraph, PositionX, PositionY, OutNode, OutNodeTitle, OutNodeType);
+			}
+
+			if (!bSpawned)
+			{
+				OutErrorMessage = FString::Printf(TEXT("Variable or component '%s' not found in Blueprint '%s' and no matching Blueprint Action Database entry"), *VarName, *BlueprintName);
+				return true; // We handled it (even though it failed)
+			}
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+bool FEventAndVariableNodeCreator::TryCreateStructNode(const FString& FunctionName, TSharedPtr<FJsonObject> ParamsObject,
+	UEdGraph* EventGraph, int32 PositionX, int32 PositionY,
+	UEdGraphNode*& OutNode, FString& OutNodeTitle, FString& OutNodeType, FString& OutErrorMessage)
+{
+	// EXACT COPY from BlueprintNodeCreationService.cpp lines 864-980
+	if (FunctionName.Equals(TEXT("BreakStruct"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("Break Struct"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("MakeStruct"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("Make Struct"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("UK2Node_BreakStruct"), ESearchCase::IgnoreCase) ||
+		 FunctionName.Equals(TEXT("UK2Node_MakeStruct"), ESearchCase::IgnoreCase))
+	{
+		bool bIsBreakStruct = FunctionName.Contains(TEXT("Break"), ESearchCase::IgnoreCase);
+
+		// Extract struct type from parameters
+		FString StructTypeName;
+		bool bFoundStructType = false;
+
+		if (ParamsObject.IsValid())
+		{
+			// First check at root level
+			if (ParamsObject->TryGetStringField(TEXT("struct_type"), StructTypeName) && !StructTypeName.IsEmpty())
+			{
+				bFoundStructType = true;
+				UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found struct_type '%s' at root level"), *StructTypeName);
+			}
+			else
+			{
+				// Then check nested under kwargs object
+				const TSharedPtr<FJsonObject>* KwargsObject;
+				if (ParamsObject->TryGetObjectField(TEXT("kwargs"), KwargsObject) && KwargsObject->IsValid())
+				{
+					if ((*KwargsObject)->TryGetStringField(TEXT("struct_type"), StructTypeName) && !StructTypeName.IsEmpty())
+					{
+						bFoundStructType = true;
+						UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found struct_type '%s' in kwargs"), *StructTypeName);
+					}
+				}
+			}
+		}
+
+		if (!bFoundStructType)
+		{
+			UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: struct_type parameter is required for %s operations"), bIsBreakStruct ? TEXT("BreakStruct") : TEXT("MakeStruct"));
+			OutErrorMessage = FString::Printf(TEXT("struct_type parameter is required for %s operations"), bIsBreakStruct ? TEXT("BreakStruct") : TEXT("MakeStruct"));
+			return true; // We handled it (even though it failed)
+		}
+
+		// Find the struct type
+		UScriptStruct* StructType = nullptr;
+
+		// First, try using AssetDiscoveryService which handles user-defined structs automatically
+		// This allows simple names like "S_InventorySlot" without requiring full paths
+		StructType = FAssetDiscoveryService::Get().FindStructType(StructTypeName);
+		if (StructType)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found struct type '%s' using AssetDiscoveryService"), *StructType->GetName());
+		}
+
+		// Fallback: Try multiple variations of struct name resolution for C++ structs
+		if (!StructType)
+		{
+			TArray<FString> StructNameVariations = {
+				StructTypeName,
+				FString::Printf(TEXT("F%s"), *StructTypeName),
+				FString::Printf(TEXT("/Script/Engine.%s"), *StructTypeName),
+				FString::Printf(TEXT("/Script/Engine.F%s"), *StructTypeName),
+				FString::Printf(TEXT("/Script/CoreUObject.%s"), *StructTypeName),
+				FString::Printf(TEXT("/Script/CoreUObject.F%s"), *StructTypeName)
+			};
+
+			for (const FString& StructName : StructNameVariations)
+			{
+				StructType = FindObject<UScriptStruct>(nullptr, *StructName);
+				if (StructType)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Found struct type '%s' using FindObject with name '%s'"), *StructType->GetName(), *StructName);
+					break;
+				}
+			}
+		}
+
+		// Final fallback: If not found by FindObject, try using LoadObject for asset paths
+		if (!StructType && StructTypeName.StartsWith(TEXT("/Game/")))
+		{
+			StructType = LoadObject<UScriptStruct>(nullptr, *StructTypeName);
+			if (StructType)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Loaded struct type '%s' using LoadObject"), *StructType->GetName());
+			}
+		}
+
+		if (!StructType)
+		{
+			UE_LOG(LogTemp, Error, TEXT("CreateNodeByActionName: Could not find struct type '%s'"), *StructTypeName);
+			OutErrorMessage = FString::Printf(TEXT("Struct type not found: %s"), *StructTypeName);
+			return true; // We handled it (even though it failed)
+		}
+
+		// Create the appropriate struct node
+		if (bIsBreakStruct)
+		{
+			UK2Node_BreakStruct* BreakNode = NewObject<UK2Node_BreakStruct>(EventGraph);
+			BreakNode->StructType = StructType;
+			BreakNode->NodePosX = PositionX;
+			BreakNode->NodePosY = PositionY;
+			BreakNode->CreateNewGuid();
+			EventGraph->AddNode(BreakNode, true, true);
+			BreakNode->PostPlacedNewNode();
+			BreakNode->AllocateDefaultPins();
+
+			OutNode = BreakNode;
+			OutNodeTitle = FString::Printf(TEXT("Break %s"), *StructType->GetDisplayNameText().ToString());
+			OutNodeType = TEXT("UK2Node_BreakStruct");
+
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Successfully created BreakStruct node for '%s'"), *StructType->GetName());
+		}
+		else
+		{
+			UK2Node_MakeStruct* MakeNode = NewObject<UK2Node_MakeStruct>(EventGraph);
+			MakeNode->StructType = StructType;
+			MakeNode->NodePosX = PositionX;
+			MakeNode->NodePosY = PositionY;
+			MakeNode->CreateNewGuid();
+			EventGraph->AddNode(MakeNode, true, true);
+			MakeNode->PostPlacedNewNode();
+			MakeNode->AllocateDefaultPins();
+
+			OutNode = MakeNode;
+			OutNodeTitle = FString::Printf(TEXT("Make %s"), *StructType->GetDisplayNameText().ToString());
+			OutNodeType = TEXT("UK2Node_MakeStruct");
+
+			UE_LOG(LogTemp, Warning, TEXT("CreateNodeByActionName: Successfully created MakeStruct node for '%s'"), *StructType->GetName());
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+bool FEventAndVariableNodeCreator::TryCreateCallParentFunctionNode(const FString& FunctionName, TSharedPtr<FJsonObject> ParamsObject,
+	UBlueprint* Blueprint, UEdGraph* EventGraph, int32 PositionX, int32 PositionY,
+	UEdGraphNode*& OutNode, FString& OutNodeTitle, FString& OutNodeType, FString& OutErrorMessage)
+{
+	// Check for "Parent: FunctionName" or "CallParentFunction" pattern
+	FString ParentFunctionName;
+
+	if (FunctionName.StartsWith(TEXT("Parent: "), ESearchCase::IgnoreCase))
+	{
+		ParentFunctionName = FunctionName.RightChop(8); // Remove "Parent: " prefix
+	}
+	else if (FunctionName.StartsWith(TEXT("Parent:"), ESearchCase::IgnoreCase))
+	{
+		ParentFunctionName = FunctionName.RightChop(7); // Remove "Parent:" prefix
+	}
+	else if (FunctionName.Equals(TEXT("CallParentFunction"), ESearchCase::IgnoreCase))
+	{
+		// Get function name from kwargs
+		if (ParamsObject.IsValid())
+		{
+			if (!ParamsObject->TryGetStringField(TEXT("parent_function"), ParentFunctionName))
+			{
+				const TSharedPtr<FJsonObject>* KwargsObject;
+				if (ParamsObject->TryGetObjectField(TEXT("kwargs"), KwargsObject) && KwargsObject->IsValid())
+				{
+					(*KwargsObject)->TryGetStringField(TEXT("parent_function"), ParentFunctionName);
+				}
+			}
+		}
+
+		if (ParentFunctionName.IsEmpty())
+		{
+			OutErrorMessage = TEXT("CallParentFunction requires 'parent_function' parameter specifying the function name to call");
+			return true;
+		}
+	}
+	else
+	{
+		return false; // Not a parent function call pattern
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("TryCreateCallParentFunctionNode: Creating parent call for function '%s'"), *ParentFunctionName);
+
+	// Find the parent class
+	UClass* ParentClass = Blueprint->ParentClass;
+	if (!ParentClass)
+	{
+		OutErrorMessage = FString::Printf(TEXT("Blueprint '%s' has no parent class"), *Blueprint->GetName());
+		return true;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("TryCreateCallParentFunctionNode: Parent class is '%s'"), *ParentClass->GetName());
+
+	// Find the function in the parent class hierarchy
+	UFunction* ParentFunction = ParentClass->FindFunctionByName(FName(*ParentFunctionName));
+	if (!ParentFunction)
+	{
+		// Try with common prefixes
+		TArray<FString> FunctionNameVariants = {
+			ParentFunctionName,
+			FString::Printf(TEXT("BP_%s"), *ParentFunctionName),
+			FString::Printf(TEXT("K2_%s"), *ParentFunctionName)
+		};
+
+		for (const FString& Variant : FunctionNameVariants)
+		{
+			ParentFunction = ParentClass->FindFunctionByName(FName(*Variant));
+			if (ParentFunction)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("TryCreateCallParentFunctionNode: Found function with variant name '%s'"), *Variant);
+				break;
+			}
+		}
+	}
+
+	if (!ParentFunction)
+	{
+		OutErrorMessage = FString::Printf(TEXT("Function '%s' not found in parent class '%s' or its hierarchy"),
+			*ParentFunctionName, *ParentClass->GetName());
+		return true;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("TryCreateCallParentFunctionNode: Found parent function '%s' in class '%s'"),
+		*ParentFunction->GetName(), *ParentFunction->GetOwnerClass()->GetName());
+
+	// Create the UK2Node_CallParentFunction node
+	UK2Node_CallParentFunction* ParentCallNode = NewObject<UK2Node_CallParentFunction>(EventGraph);
+	if (!ParentCallNode)
+	{
+		OutErrorMessage = TEXT("Failed to create UK2Node_CallParentFunction object");
+		return true;
+	}
+
+	// Initialize the node with the parent function
+	ParentCallNode->SetFromFunction(ParentFunction);
+	ParentCallNode->NodePosX = PositionX;
+	ParentCallNode->NodePosY = PositionY;
+
+	// Add node to graph and set up pins
+	EventGraph->AddNode(ParentCallNode, true, false);
+	ParentCallNode->CreateNewGuid();
+	ParentCallNode->PostPlacedNewNode();
+	ParentCallNode->AllocateDefaultPins();
+
+	OutNode = ParentCallNode;
+	OutNodeTitle = FString::Printf(TEXT("Parent: %s"), *ParentFunctionName);
+	OutNodeType = TEXT("UK2Node_CallParentFunction");
+
+	UE_LOG(LogTemp, Warning, TEXT("TryCreateCallParentFunctionNode: Successfully created parent function call node for '%s'"), *ParentFunctionName);
+	return true;
+}
